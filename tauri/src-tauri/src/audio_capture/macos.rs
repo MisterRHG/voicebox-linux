@@ -1,4 +1,4 @@
-use crate::audio_capture::AudioCaptureState;
+use crate::audio_capture::{AudioCaptureState, MicrophoneCaptureState};
 use base64::{engine::general_purpose, Engine as _};
 use hound::{WavSpec, WavWriter};
 use screencapturekit::{
@@ -260,6 +260,33 @@ fn samples_to_wav(samples: &[f32], sample_rate: u32, channels: u16) -> Result<Ve
 
     writer.finalize()
         .map_err(|e| format!("Failed to finalize WAV: {}", e))?;
-
+    
     Ok(buffer)
+}
+
+// Microphone-capture stubs for macOS. macOS already has working mic
+// capture via the webview's getUserMedia, so on macOS we keep using
+// that path. These stubs return "not supported" so the React side
+// knows to fall back to getUserMedia on macOS.
+pub async fn start_mic_capture(
+    _state: &MicrophoneCaptureState,
+    _max_duration_secs: u32,
+) -> Result<(), String> {
+    Err(
+        "Microphone capture via Rust is not yet implemented for macOS; the webview getUserMedia path is used."
+            .to_string(),
+    )
+}
+
+pub async fn stop_mic_capture(
+    _state: &MicrophoneCaptureState,
+) -> Result<String, String> {
+    Err(
+        "Microphone capture via Rust is not yet implemented for macOS; the webview getUserMedia path is used."
+            .to_string(),
+    )
+}
+
+pub fn is_mic_supported() -> bool {
+    false
 }

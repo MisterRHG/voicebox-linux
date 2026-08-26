@@ -38,5 +38,9 @@ pub fn is_trusted() -> bool {
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn is_trusted() -> bool {
-    false
+    // Linux has no "Accessibility" or "Input Monitoring" permission gate
+    // — the macOS TCC concepts don't apply. There's nothing for the user
+    // to grant or deny, so we report trusted=true and let dictation run.
+    // Mirror the input_monitoring.rs policy.
+    true
 }

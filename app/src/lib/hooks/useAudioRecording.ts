@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { usePlatform } from '@/platform/PlatformContext';
+import { invoke } from '@tauri-apps/api/core';
 import { convertToWav } from '@/lib/utils/audio';
 
 interface UseAudioRecordingOptions {
@@ -29,14 +30,45 @@ export function useAudioRecording({
       cancelledRef.current = false;
       setDuration(0);
 
-      // Check if getUserMedia is available
-      // In Tauri, navigator.mediaDevices might not be available immediately
-      if (typeof navigator === 'undefined') {
-        const errorMsg =
-          'Navigator API is not available. This might be a Tauri configuration issue.';
-        setError(errorMsg);
-        throw new Error(errorMsg);
+      // On Linux + Tauri, the webview's getUserMedia is blocked by
+      // xdg-desktop-portal (returns NotAllowedError). We bypass the
+      // webview entirely and use a Rust-side mic capture command
+      // (`start_mic_capture` / `stop_mic_capture`) which uses
+      // cpal+pactl directly. The returned base64 WAV blob is fed
+      // into the same onRecordingComplete path as the webm blob.
+      if (
+        platform.metadata.isTauri &&
+        typeof navigator !== 'undefined' &&
+        navigator.userAgent?.toLowerCase().includes('linux')
+      ) {
+        // Linux + Tauri bypasses the webview getUserMedia path (which
+        // xdg-desktop-portal denies in this app's webkit2gtk config)
+        // by capturing the mic directly via the Rust side using
+        // cpal+pactl. The base64 WAV blob returned by stop_mic_capture
+        // is fed into the same onRecordingComplete path as the webm
+        // blob from getUserMedia.
+        const micSupported = await invoke<boolean>('is_mic_supported');
+        if (!micSupported) {
+          const errorMsg =
+            'No microphone input device available. Check that your mic is connected and not muted.';
+          setError(errorMsg);
+          throw new Error(errorMsg);
+        }
+        const maxDur = maxDurationSeconds ?? 600; // 10 min safety cap
+        await invoke('start_mic_capture', { maxDurationSecs: maxDur });
+        setIsRecording(true);
+        startTimeRef.current = Date.now();
+        timerRef.current = window.setInterval(() => {
+          if (startTimeRef.current) {
+            const elapsed = (Date.now() - startTimeRef.current) / 1000;
+            setDuration(elapsed);
+          }
+        }, 100);
+        return;
       }
+
+      // Non-Linux path (macOS / Windows / web): use webview getUserMedia
+      // (works there because the OS handles mic permission natively).
 
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         // Try waiting a bit for Tauri webview to initialize
@@ -164,7 +196,45 @@ export function useAudioRecording({
     }
   }, [maxDurationSeconds, onRecordingComplete]);
 
-  const stopRecording = useCallback(() => {
+  const stopRecording = useCallback(async () => {
+    if (!isRecording) return;
+
+    // Detect Rust-mic-capture path: no MediaRecorder was created, but
+    // a recording IS active (startRecording took the Linux branch and
+    // returned early without creating a MediaRecorder).
+    const isRustMicPath =
+      platform.metadata.isTauri &&
+      typeof navigator !== 'undefined' &&
+      navigator.userAgent?.toLowerCase().includes('linux') &&
+      mediaRecorderRef.current === null;
+
+    if (isRustMicPath) {
+      setIsRecording(false);
+      if (timerRef.current !== null) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+      const recordedDuration = startTimeRef.current
+        ? (Date.now() - startTimeRef.current) / 1000
+        : undefined;
+      startTimeRef.current = null;
+      try {
+        const base64Wav = await invoke<string>('stop_mic_capture');
+        // Decode base64 → bytes → Blob with mime type audio/wav
+        const binary = atob(base64Wav);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) {
+          bytes[i] = binary.charCodeAt(i);
+        }
+        const wavBlob = new Blob([bytes], { type: 'audio/wav' });
+        onRecordingComplete?.(wavBlob, recordedDuration);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        setError(msg);
+      }
+      return;
+    }
+
     if (mediaRecorderRef.current && isRecording) {
       mediaRecorderRef.current.stop();
       setIsRecording(false);
@@ -174,7 +244,7 @@ export function useAudioRecording({
         timerRef.current = null;
       }
     }
-  }, [isRecording]);
+  }, [isRecording, onRecordingComplete, platform]);
 
   const cancelRecording = useCallback(() => {
     if (mediaRecorderRef.current) {

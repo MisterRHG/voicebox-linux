@@ -4,24 +4,27 @@ import { useDictationReadiness } from '@/lib/hooks/useDictationReadiness';
 import { useCaptureSettings } from '@/lib/hooks/useSettings';
 import { usePlatform } from '@/platform/PlatformContext';
 
+// Hard-coded defaults matching what the settings UI defaults to.
+// Used on initial mount BEFORE the React Query for capture_settings has
+// resolved, so the global hotkey fires reliably even if settings haven't
+// loaded yet. Once settings resolve, useChordSync re-syncs with the user's
+// saved choices.
+const DEFAULT_PUSH_KEYS = ['ControlRight', 'ShiftRight'];
+const DEFAULT_TOGGLE_KEYS = ['ControlRight', 'ShiftRight', 'Space'];
+
 /**
  * Spawn (or quiet) the global hotkey monitor based on the saved
  * `capture_settings.hotkey_enabled` flag and the recording readiness gates,
  * and keep its bindings in sync with the user's chord choices.
  *
  * Boot sequence:
- *  - hotkey_enabled = false OR a recording gate is missing → call
- *    `disable_hotkey` (no-op if monitor was never spawned). Crucially, we do
- *    *not* call `enable_hotkey` in this state, so the macOS Input Monitoring
- *    TCC prompt is never triggered for users who haven't opted in, AND the
- *    chord physically can't fire when models aren't downloaded — preventing
- *    the "stuck pill" failure mode where dictation triggers but has nowhere
- *    to land.
- *  - hotkey_enabled = true AND recording gates green → call `enable_hotkey` with
- *    the saved chords. This creates the CGEventTap and triggers the TCC
- *    prompt on first opt-in. Re-runs whenever a gate flips green (e.g. the
- *    user finishes downloading Whisper in another tab) so the chord
- *    auto-arms without making the user toggle off/on.
+ *  - On first mount: arm the hotkey with the default chords immediately,
+ *    so the user gets global dictation even before settings resolve.
+ *  - When settings arrive: re-sync the hotkey with the saved chord
+ *    choices (if the user customised them).
+ *  - When a gate flips green (e.g. user finishes downloading Whisper in
+ *    another tab) the hotkey auto-arms without making the user toggle
+ *    off/on.
  *
  * Call once from the main app shell.
  */
@@ -30,25 +33,40 @@ export function useChordSync() {
   const { settings } = useCaptureSettings();
   const { canRecord } = useDictationReadiness();
   const enabled = settings?.hotkey_enabled;
-  const pushKeys = settings?.chord_push_to_talk_keys;
-  const toggleKeys = settings?.chord_toggle_to_talk_keys;
+  const pushKeys = settings?.chord_push_to_talk_keys ?? DEFAULT_PUSH_KEYS;
+  const toggleKeys = settings?.chord_toggle_to_talk_keys ?? DEFAULT_TOGGLE_KEYS;
 
+  // Initial mount: arm with default chords unconditionally so dictation
+  // works even if the React Query for capture_settings is slow to resolve.
   useEffect(() => {
     if (!platform.metadata.isTauri) return;
-    if (enabled === undefined || !pushKeys || !toggleKeys) return;
-    const shouldArm = enabled && canRecord;
-    const command = shouldArm ? 'enable_hotkey' : 'disable_hotkey';
-    const args = shouldArm ? { pushToTalk: pushKeys, toggleToTalk: toggleKeys } : {};
-    invoke(command, args).catch((err) => {
-      console.warn(`[chord-sync] ${command} failed:`, err);
-    });
+    invoke('enable_hotkey', { pushToTalk: pushKeys, toggleToTalk: toggleKeys }).catch(
+      () => {
+        // First attempt may fail if the keytap permission prompt hasn't
+        // been answered yet. The settings-resolved effect below will retry.
+      },
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [platform.metadata.isTauri]);
+
+  // Re-sync when settings change. If hotkey_enabled is explicitly false,
+  // disable the monitor. Otherwise arm with the latest chords.
+  useEffect(() => {
+    if (!platform.metadata.isTauri) return;
+    if (enabled === undefined) return; // settings not yet loaded
+    if (enabled === false) {
+      invoke('disable_hotkey').catch(() => {});
+      return;
+    }
+    if (!canRecord) return;
+    invoke('enable_hotkey', { pushToTalk: pushKeys, toggleToTalk: toggleKeys }).catch(
+      () => {},
+    );
   }, [
     platform.metadata.isTauri,
     enabled,
     canRecord,
-    // Stringify so a referentially-new array with the same content
-    // doesn't fire a redundant invoke on every settings refetch.
-    pushKeys?.join(','),
-    toggleKeys?.join(','),
+    pushKeys.join(','),
+    toggleKeys.join(','),
   ]);
 }

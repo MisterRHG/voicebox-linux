@@ -1,4 +1,4 @@
-use crate::audio_capture::AudioCaptureState;
+use crate::audio_capture::{AudioCaptureState, MicrophoneCaptureState};
 use base64::{engine::general_purpose, Engine as _};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
@@ -7,6 +7,29 @@ use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
+
+/// Try to find the default microphone input source via `pactl`.
+/// Returns the source name (e.g. "alsa_input.pci-0000_00_1f.3.analog-stereo") if found.
+fn find_default_source_via_pactl() -> Option<String> {
+    let output = std::process::Command::new("pactl")
+        .args(["get-default-source"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let source_name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if source_name.is_empty() {
+        return None;
+    }
+    eprintln!(
+        "Linux mic capture: Found default source via pactl: {}",
+        source_name
+    );
+    Some(source_name)
+}
 
 /// Try to find a PulseAudio/PipeWire monitor source using `pactl`.
 /// Returns the source name (e.g. "alsa_output.pci-0000_0d_00.6.analog-stereo.monitor") if found.
@@ -64,6 +87,30 @@ fn find_monitor_source_via_pactl() -> Option<String> {
     }
 
     None
+}
+
+/// Select the microphone device: prefer an exact match against the
+/// default source name reported by `pactl`, otherwise fall back to the
+/// host's default input device. Unlike system audio, we do NOT want a
+/// `.monitor` source — those are loopback of speakers, not microphones.
+fn select_mic_device(host: &cpal::Host, mic_source: Option<&str>) -> Option<cpal::Device> {
+    let devices: Vec<cpal::Device> = host.input_devices().ok()?.collect();
+
+    if let Some(target) = mic_source {
+        if let Some(pos) = devices
+            .iter()
+            .position(|d| d.name().map(|n| n == target).unwrap_or(false))
+        {
+            eprintln!(
+                "Linux mic capture: Using pactl default source device: {}",
+                target
+            );
+            return devices.into_iter().nth(pos);
+        }
+    }
+
+    eprintln!("Linux mic capture: No pactl match, falling back to default input");
+    host.default_input_device()
 }
 
 /// Select the capture device: prefer an exact match against the monitor
@@ -379,4 +426,242 @@ fn samples_to_wav(samples: &[f32], sample_rate: u32, channels: u16) -> Result<Ve
         .map_err(|e| format!("Failed to finalize WAV: {}", e))?;
 
     Ok(buffer)
+}
+
+// ========================================================================
+// Microphone capture (for dictation). Distinct from system-audio capture:
+//   - Uses the default mic source (`pactl get-default-source`), not a
+//     monitor of a sink.
+//   - Uses its own MicrophoneCaptureState so system-audio and dictation
+//     can run simultaneously without interfering with each other.
+//   - Returns WAV bytes (base64) when stopped, ready for the existing
+//     transcription endpoint to consume.
+// ========================================================================
+
+pub async fn start_mic_capture(
+    state: &MicrophoneCaptureState,
+    max_duration_secs: u32,
+) -> Result<(), String> {
+    state.reset();
+
+    let samples = state.samples.clone();
+    let sample_rate_arc = state.sample_rate.clone();
+    let channels_arc = state.channels.clone();
+    let stop_tx = state.stop_tx.clone();
+    let error_arc = state.error.clone();
+
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let stop_flag_clone = stop_flag.clone();
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
+    *stop_tx.lock().unwrap() = Some(tx);
+
+    tokio::spawn(async move {
+        rx.recv().await;
+        stop_flag_clone.store(true, Ordering::Relaxed);
+    });
+
+    thread::spawn(move || {
+        let host = cpal::default_host();
+        let mic_source = find_default_source_via_pactl();
+
+        let device = match select_mic_device(&host, mic_source.as_deref()) {
+            Some(d) => d,
+            None => {
+                let error_msg = "No microphone input device available".to_string();
+                eprintln!("{}", error_msg);
+                *error_arc.lock().unwrap() = Some(error_msg);
+                return;
+            }
+        };
+
+        let device_name = device.name().unwrap_or_else(|_| "unknown".to_string());
+        eprintln!("Linux mic capture: Using device: {}", device_name);
+
+        let config = match device.default_input_config() {
+            Ok(c) => c,
+            Err(e) => {
+                let error_msg = format!("Failed to get mic input config: {}", e);
+                eprintln!("{}", error_msg);
+                *error_arc.lock().unwrap() = Some(error_msg);
+                return;
+            }
+        };
+
+        let sample_rate = config.sample_rate().0;
+        let channels = config.channels();
+        let sample_format = config.sample_format();
+
+        eprintln!(
+            "Linux mic capture: Config - {}Hz, {} channels, format: {:?}",
+            sample_rate, channels, sample_format
+        );
+
+        *sample_rate_arc.lock().unwrap() = sample_rate;
+        *channels_arc.lock().unwrap() = channels;
+
+        let stream_config = StreamConfig {
+            channels,
+            sample_rate: cpal::SampleRate(sample_rate),
+            buffer_size: cpal::BufferSize::Default,
+        };
+
+        let samples_clone = samples.clone();
+        let error_arc_clone = error_arc.clone();
+        let stop_flag_for_stream = stop_flag.clone();
+
+        let err_fn = {
+            let error_arc = error_arc.clone();
+            move |err: cpal::StreamError| {
+                let error_msg = format!("Mic stream error: {}", err);
+                eprintln!("{}", error_msg);
+                *error_arc.lock().unwrap() = Some(error_msg);
+            }
+        };
+
+        let stream = match sample_format {
+            SampleFormat::F32 => {
+                let samples = samples_clone.clone();
+                let stop = stop_flag_for_stream.clone();
+                device.build_input_stream(
+                    &stream_config,
+                    move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let mut guard = samples.lock().unwrap();
+                        guard.extend_from_slice(data);
+                    },
+                    err_fn,
+                    None,
+                )
+            }
+            SampleFormat::I16 => {
+                let samples = samples_clone.clone();
+                let stop = stop_flag_for_stream.clone();
+                device.build_input_stream(
+                    &stream_config,
+                    move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let mut guard = samples.lock().unwrap();
+                        for &s in data {
+                            guard.push(s as f32 / 32768.0);
+                        }
+                    },
+                    err_fn,
+                    None,
+                )
+            }
+            SampleFormat::U16 => {
+                let samples = samples_clone.clone();
+                let stop = stop_flag_for_stream.clone();
+                device.build_input_stream(
+                    &stream_config,
+                    move |data: &[u16], _: &cpal::InputCallbackInfo| {
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let mut guard = samples.lock().unwrap();
+                        for &s in data {
+                            guard.push((s as f32 / 32768.0) - 1.0);
+                        }
+                    },
+                    err_fn,
+                    None,
+                )
+            }
+            _ => {
+                let error_msg = format!("Unsupported mic sample format: {:?}", sample_format);
+                eprintln!("{}", error_msg);
+                *error_arc_clone.lock().unwrap() = Some(error_msg);
+                return;
+            }
+        };
+
+        let stream = match stream {
+            Ok(s) => s,
+            Err(e) => {
+                let error_msg = format!("Failed to build mic input stream: {}", e);
+                eprintln!("{}", error_msg);
+                *error_arc_clone.lock().unwrap() = Some(error_msg);
+                return;
+            }
+        };
+
+        if let Err(e) = stream.play() {
+            let error_msg = format!("Failed to start mic stream: {}", e);
+            eprintln!("{}", error_msg);
+            *error_arc_clone.lock().unwrap() = Some(error_msg);
+            return;
+        }
+
+        eprintln!("Linux mic capture: Stream started successfully");
+
+        loop {
+            if stop_flag.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        eprintln!("Linux mic capture: Stream stopped");
+    });
+
+    // Timeout task
+    let stop_tx_clone = state.stop_tx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_secs(max_duration_secs as u64)).await;
+        let tx = stop_tx_clone.lock().unwrap().take();
+        if let Some(tx) = tx {
+            let _ = tx.send(()).await;
+        }
+    });
+
+    Ok(())
+}
+
+pub async fn stop_mic_capture(state: &MicrophoneCaptureState) -> Result<String, String> {
+    if let Some(tx) = state.stop_tx.lock().unwrap().take() {
+        let _ = tx.send(());
+    }
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    if let Some(error) = state.error.lock().unwrap().as_ref() {
+        return Err(error.clone());
+    }
+
+    let samples = state.samples.lock().unwrap().clone();
+    let sample_rate = *state.sample_rate.lock().unwrap();
+    let channels = *state.channels.lock().unwrap();
+
+    if samples.is_empty() {
+        return Err(
+            "No audio samples captured from microphone. Check that the mic is connected and not muted."
+                .to_string(),
+        );
+    }
+
+    let wav_data = samples_to_wav(&samples, sample_rate, channels)?;
+    let base64_data = general_purpose::STANDARD.encode(&wav_data);
+
+    eprintln!(
+        "Linux mic capture: stopped, captured {} samples ({}Hz, {}ch), WAV {} bytes, base64 {} chars",
+        samples.len(),
+        sample_rate,
+        channels,
+        wav_data.len(),
+        base64_data.len()
+    );
+
+    Ok(base64_data)
+}
+
+pub fn is_mic_supported() -> bool {
+    if find_default_source_via_pactl().is_some() {
+        return true;
+    }
+    cpal::default_host().default_input_device().is_some()
 }

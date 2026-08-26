@@ -944,6 +944,32 @@ fn is_system_audio_supported() -> bool {
     audio_capture::is_supported()
 }
 
+// Microphone capture for dictation. On Linux this bypasses the webview
+// getUserMedia → xdg-desktop-portal chain (which denies mic access in
+// this app's webkit2gtk configuration) by capturing the mic directly
+// via cpal+pactl on the Rust side. On macOS/Windows these are stubs
+// that return "not supported" — the webview getUserMedia path works
+// there and is preserved.
+#[command]
+async fn start_mic_capture(
+    state: State<'_, audio_capture::MicrophoneCaptureState>,
+    max_duration_secs: u32,
+) -> Result<(), String> {
+    audio_capture::start_mic_capture(&state, max_duration_secs).await
+}
+
+#[command]
+async fn stop_mic_capture(
+    state: State<'_, audio_capture::MicrophoneCaptureState>,
+) -> Result<String, String> {
+    audio_capture::stop_mic_capture(&state).await
+}
+
+#[command]
+fn is_mic_supported() -> bool {
+    audio_capture::is_mic_supported()
+}
+
 #[command]
 fn list_audio_output_devices(
     state: State<'_, audio_output::AudioOutputState>,
@@ -1393,6 +1419,7 @@ pub fn run() {
             backend_override: Mutex::new(None),
         })
         .manage(audio_capture::AudioCaptureState::new())
+        .manage(audio_capture::MicrophoneCaptureState::new())
         .manage(audio_output::AudioOutputState::new())
         .setup(|app| {
             #[cfg(desktop)]
@@ -1516,6 +1543,9 @@ pub fn run() {
             start_system_audio_capture,
             stop_system_audio_capture,
             is_system_audio_supported,
+            start_mic_capture,
+            stop_mic_capture,
+            is_mic_supported,
             list_audio_output_devices,
             play_audio_to_devices,
             stop_audio_playback,

@@ -1,4 +1,4 @@
-use crate::audio_capture::AudioCaptureState;
+use crate::audio_capture::{AudioCaptureState, MicrophoneCaptureState};
 use base64::{engine::general_purpose, Engine as _};
 use hound::{WavSpec, WavWriter};
 use std::io::Cursor;
@@ -285,4 +285,30 @@ fn samples_to_wav(samples: &[f32], sample_rate: u32, channels: u16) -> Result<Ve
         .map_err(|e| format!("Failed to finalize WAV: {}", e))?;
 
     Ok(buffer)
+}
+
+// Microphone-capture stubs for Windows. Windows already has working
+// mic capture via the webview's getUserMedia, so we keep that path.
+// These stubs satisfy the platform-gated module exports.
+pub async fn start_mic_capture(
+    _state: &MicrophoneCaptureState,
+    _max_duration_secs: u32,
+) -> Result<(), String> {
+    Err(
+        "Microphone capture via Rust is not yet implemented for Windows; the webview getUserMedia path is used."
+            .to_string(),
+    )
+}
+
+pub async fn stop_mic_capture(
+    _state: &MicrophoneCaptureState,
+) -> Result<String, String> {
+    Err(
+        "Microphone capture via Rust is not yet implemented for Windows; the webview getUserMedia path is used."
+            .to_string(),
+    )
+}
+
+pub fn is_mic_supported() -> bool {
+    false
 }
