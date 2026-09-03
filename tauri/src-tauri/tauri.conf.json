@@ -31,6 +31,11 @@
       "gen/Assets.car": "./",
       "gen/voicebox.icns": "./",
       "gen/partial.plist": "./"
+    },
+    "linux": {
+      "appimage": {
+        "bundleMediaFramework": true
+      }
     }
   },
   "app": {
